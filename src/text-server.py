@@ -1,6 +1,7 @@
 import argparse
 import json
 import pycurl
+import re
 from flask import Flask, url_for, jsonify, request
 from flask_cors import CORS, cross_origin
 python3 = True
@@ -10,12 +11,12 @@ if python3:
     import certifi
 from googlecloudapi import getCloudAPIDetails, saveImage
 
-SEARCH_URL = 'https://www.google.com/searchbyimage?hl=en-US&image_url='
+SEARCH_URL = 'https://www.google.com/search?tbm=isch&hl=en&ijn=0&q='
 
 app = Flask(__name__)
 
 
-@app.route('/search', methods = ['POST'])
+@app.route('/search-text', methods = ['POST'])
 def search():
     if request.headers['Content-Type'] != 'application/json':
         return "Requests must be in JSON format. Please make sure the header is 'application/json' and the JSON is valid."
@@ -23,12 +24,12 @@ def search():
     client_data = json.loads(client_json)
 
     if 'cloud_api' in client_data and client_data['cloud_api'] == True:
-        saveImage(client_data['image_url'])
+        saveImage(client_data['text_query'])
         data = getCloudAPIDetails("./default.jpg")
         return jsonify(data)
 
     else:
-        code = doImageSearch(SEARCH_URL + client_data['image_url'])
+        code = doImageSearch(SEARCH_URL + client_data['text_query'])
 
         if 'resized_images' in client_data and client_data['resized_images'] == True:
             return parseResults(code, resized=True)
@@ -40,7 +41,7 @@ def doImageSearch(full_url):
     """Return the HTML page response."""
 
     returned_code = bytesIOModule.BytesIO()
-    # full_url = SEARCH_URL + image_url
+    # full_url = SEARCH_URL + text_query
 
     print(returned_code)
 
@@ -62,25 +63,55 @@ def parseResults(code, resized=False):
     """Parse/Scrape the HTML code for the info we want."""
     
     soup = BeautifulSoup(code, 'html.parser')
-    with open("result.txt", "a") as o:
+    with open("result.txt", "w") as o:
         o.write(code)
     results = {
         'links': [],
-        'descriptions': [],
-        'titles': [],
-        'similar_images': [],
-        'best_guess': ''
     }
 
-    for div in soup.findAll('div', attrs={'class':'yuRUbf'})[2:]:
-        sLink = div.find('a')
-        results['links'].append(sLink['href'])
+    # this steps could be refactored to a more compact
+    all_script_tags = soup.select('script')
 
-    for desc in soup.findAll('span', attrs={'class':'st'}):
-        results['descriptions'].append(desc.get_text())
+    # # https://regex101.com/r/48UZhY/4
+    matched_images_data = ''.join(re.findall(r"AF_initDataCallback\(([^<]+)\);", str(all_script_tags)))
+    
+    # https://kodlogs.com/34776/json-decoder-jsondecodeerror-expecting-property-name-enclosed-in-double-quotes
+    # if you try to json.loads() without json.dumps() it will throw an error:
+    # "Expecting property name enclosed in double quotes"
+    matched_images_data_fix = json.dumps(matched_images_data)
+    matched_images_data_json = json.loads(matched_images_data_fix)
 
-    for title in soup.findAll('h3', attrs={'class':'LC20lb'})[2:]:
-        results['titles'].append(title.get_text())
+    # https://regex101.com/r/pdZOnW/3
+    matched_google_image_data = re.findall(r'\[\"GRID_STATE0\",null,\[\[1,\[0,\".*?\",(.*),\"All\",', matched_images_data_json)
+
+    # https://regex101.com/r/NnRg27/1
+    matched_google_images_thumbnails = ', '.join(
+        re.findall(r'\[\"(https\:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]',
+                   str(matched_google_image_data))).split(', ')
+
+    for fixed_google_image_thumbnail in matched_google_images_thumbnails:
+        # https://stackoverflow.com/a/4004439/15164646 comment by Frédéric Hamidi
+        google_image_thumbnail_not_fixed = bytes(fixed_google_image_thumbnail, 'ascii').decode('unicode-escape')
+        # after first decoding, Unicode characters are still present. After the second iteration, they were decoded.
+        google_image_thumbnail = bytes(google_image_thumbnail_not_fixed, 'ascii').decode('unicode-escape')
+
+    # removing previously matched thumbnails for easier full resolution image matches.
+    removed_matched_google_images_thumbnails = re.sub(
+        r'\[\"(https\:\/\/encrypted-tbn0\.gstatic\.com\/images\?.*?)\",\d+,\d+\]', '', str(matched_google_image_data))
+
+    # https://regex101.com/r/fXjfb1/4
+    # https://stackoverflow.com/a/19821774/15164646
+    matched_google_full_resolution_images = re.findall(r"(?:'|,),\[\"(https:|http.*?)\",\d+,\d+\]",
+                                                       removed_matched_google_images_thumbnails)
+
+
+    print('\nFull Resolution Images:')  # in order
+    for index, fixed_full_res_image in enumerate(matched_google_full_resolution_images):
+        # https://stackoverflow.com/a/4004439/15164646 comment by Frédéric Hamidi
+        original_size_img_not_fixed = bytes(fixed_full_res_image, 'ascii').decode('unicode-escape')
+        original_size_img = bytes(original_size_img_not_fixed, 'ascii').decode('unicode-escape')
+        results['links'].append(original_size_img)
+
 
     # for similar_image in soup.findAll('div', attrs={'rg_meta'}):
     #     tmp = json.loads(similar_image.get_text())
